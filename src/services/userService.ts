@@ -1,231 +1,270 @@
-import { User } from '../types/chat';
+// services/userService.ts
 
-export interface ExtendedUser extends User {
-  socketId: string;
-  currentRoom: string | null;
-  lastSeen: Date;
+export interface ConnectedUser {
+  id: string; // socketId
+  userId?: string; // Better Auth user ID (인증된 경우)
+  username: string; // 표시 이름
+  isOnline: boolean;
+  joinedAt: Date;
+  lastActivity: Date;
+  currentRoom?: string;
   isTyping: boolean;
-  connectionCount: number;
   ipAddress?: string;
 }
 
+export interface RoomInfo {
+  roomId: string;
+  userIds: string[]; // socketId 목록
+  userCount: number;
+  createdAt: Date;
+}
+
 export class UserService {
-  private users: Map<string, ExtendedUser> = new Map(); // socketId -> User
-  private usernameToSocketId: Map<string, string> = new Map(); // username -> socketId
-  private roomUsers: Map<string, Set<string>> = new Map(); // roomId -> Set<socketId>
+  private connectedUsers = new Map<string, ConnectedUser>(); // socketId -> user
+  private userRooms = new Map<string, string>(); // socketId -> roomId
+  private roomUsers = new Map<string, Set<string>>(); // roomId -> Set<socketId>
+  private usernameToSocketId = new Map<string, string>(); // username -> socketId (중복 체크용)
+
+  constructor() {
+    console.log("UserService initialized");
+  }
 
   // 사용자 추가
-  addUser(socketId: string, userData: Omit<User, 'id'>, ipAddress?: string): ExtendedUser | null {
-    // 중복 사용자명 체크
-    if (this.usernameToSocketId.has(userData.username)) {
-      return null; // 중복 사용자명
+  addUser(
+    socketId: string,
+    userInfo: {
+      username: string;
+      userId?: string;
+      ipAddress?: string;
+    }
+  ): ConnectedUser | null {
+    // 사용자명 중복 체크
+    if (this.usernameToSocketId.has(userInfo.username)) {
+      console.log(`Username already taken: ${userInfo.username}`);
+      return null;
     }
 
-    const user: ExtendedUser = {
+    const user: ConnectedUser = {
       id: socketId,
-      socketId,
-      username: userData.username,
+      userId: userInfo.userId,
+      username: userInfo.username,
       isOnline: true,
-      joinedAt: userData.joinedAt || new Date(),
-      currentRoom: null,
-      lastSeen: new Date(),
+      joinedAt: new Date(),
+      lastActivity: new Date(),
       isTyping: false,
-      connectionCount: 1,
-      ipAddress
+      ipAddress: userInfo.ipAddress,
     };
 
-    this.users.set(socketId, user);
-    this.usernameToSocketId.set(userData.username, socketId);
+    this.connectedUsers.set(socketId, user);
+    this.usernameToSocketId.set(userInfo.username, socketId);
 
-    console.log(`✅ User added: ${user.username} (${socketId})`);
+    console.log(`User added: ${user.username} (${socketId})`);
     return user;
   }
 
   // 사용자 제거
-  removeUser(socketId: string): ExtendedUser | null {
-    const user = this.users.get(socketId);
+  removeUser(socketId: string): ConnectedUser | null {
+    const user = this.connectedUsers.get(socketId);
     if (!user) return null;
 
-    // 현재 방에서 제거
+    // 방에서 제거
     if (user.currentRoom) {
-      this.leaveRoom(socketId, user.currentRoom);
+      this.leaveRoom(socketId);
     }
 
-    // 매핑에서 제거
-    this.users.delete(socketId);
+    // 맵에서 제거
+    this.connectedUsers.delete(socketId);
     this.usernameToSocketId.delete(user.username);
 
-    console.log(`❌ User removed: ${user.username} (${socketId})`);
+    console.log(`User removed: ${user.username} (${socketId})`);
     return user;
   }
 
-  // 사용자 정보 가져오기
-  getUser(socketId: string): ExtendedUser | null {
-    return this.users.get(socketId) || null;
+  // 사용자 정보 조회
+  getUser(socketId: string): ConnectedUser | null {
+    return this.connectedUsers.get(socketId) || null;
   }
 
-  // 사용자명으로 사용자 찾기
-  getUserByUsername(username: string): ExtendedUser | null {
-    const socketId = this.usernameToSocketId.get(username);
-    return socketId ? this.users.get(socketId) || null : null;
+  // 사용자명으로 소켓ID 조회
+  getSocketIdByUsername(username: string): string | null {
+    return this.usernameToSocketId.get(username) || null;
   }
 
-  // 사용자명 중복 체크
+  // 사용자명 사용 가능 여부 확인
   isUsernameAvailable(username: string): boolean {
     return !this.usernameToSocketId.has(username);
   }
 
   // 방에 참가
   joinRoom(socketId: string, roomId: string): boolean {
-    const user = this.users.get(socketId);
+    const user = this.connectedUsers.get(socketId);
     if (!user) return false;
 
     // 기존 방에서 나가기
-    if (user.currentRoom && user.currentRoom !== roomId) {
-      this.leaveRoom(socketId, user.currentRoom);
+    if (user.currentRoom) {
+      this.leaveRoom(socketId);
     }
 
     // 새 방에 참가
     user.currentRoom = roomId;
-    user.lastSeen = new Date();
+    this.userRooms.set(socketId, roomId);
 
+    // 방 사용자 목록에 추가
     if (!this.roomUsers.has(roomId)) {
       this.roomUsers.set(roomId, new Set());
     }
     this.roomUsers.get(roomId)!.add(socketId);
 
-    console.log(`🏠 ${user.username} joined room: ${roomId}`);
+    this.updateUserActivity(socketId);
+    console.log(`User ${user.username} joined room: ${roomId}`);
     return true;
   }
 
   // 방에서 나가기
-  leaveRoom(socketId: string, roomId: string): boolean {
-    const user = this.users.get(socketId);
-    if (!user) return false;
+  leaveRoom(socketId: string): boolean {
+    const user = this.connectedUsers.get(socketId);
+    if (!user || !user.currentRoom) return false;
 
-    const roomUsersSet = this.roomUsers.get(roomId);
-    if (roomUsersSet) {
-      roomUsersSet.delete(socketId);
-      
-      // 방이 비어있으면 삭제
-      if (roomUsersSet.size === 0) {
+    const roomId = user.currentRoom;
+
+    // 방 사용자 목록에서 제거
+    const roomUserSet = this.roomUsers.get(roomId);
+    if (roomUserSet) {
+      roomUserSet.delete(socketId);
+
+      // 방이 비어있으면 정리
+      if (roomUserSet.size === 0) {
         this.roomUsers.delete(roomId);
-        console.log(`🗑️ Empty room deleted: ${roomId}`);
       }
     }
 
-    if (user.currentRoom === roomId) {
-      user.currentRoom = null;
-    }
+    // 사용자 정보 업데이트
+    user.currentRoom = undefined;
+    this.userRooms.delete(socketId);
 
-    console.log(`🚪 ${user.username} left room: ${roomId}`);
+    console.log(`User ${user.username} left room: ${roomId}`);
     return true;
   }
 
-  // 방의 사용자 목록 가져오기
-  getRoomUsers(roomId: string): ExtendedUser[] {
+  // 방의 사용자 목록 조회
+  getRoomUsers(roomId: string): ConnectedUser[] {
     const socketIds = this.roomUsers.get(roomId);
     if (!socketIds) return [];
 
-    return Array.from(socketIds)
-      .map(socketId => this.users.get(socketId))
-      .filter((user): user is ExtendedUser => user !== undefined)
-      .sort((a, b) => a.username.localeCompare(b.username));
+    const users: ConnectedUser[] = [];
+    for (const socketId of socketIds) {
+      const user = this.connectedUsers.get(socketId);
+      if (user) {
+        users.push(user);
+      }
+    }
+
+    return users;
   }
 
-  // 온라인 사용자 목록
-  getOnlineUsers(): ExtendedUser[] {
-    return Array.from(this.users.values())
-      .filter(user => user.isOnline)
-      .sort((a, b) => a.username.localeCompare(b.username));
+  // 사용자가 특정 방에 있는지 확인
+  isUserInRoom(socketId: string, roomId: string): boolean {
+    const user = this.connectedUsers.get(socketId);
+    return user ? user.currentRoom === roomId : false;
+  }
+
+  // 사용자 활동 업데이트
+  updateUserActivity(socketId: string): boolean {
+    const user = this.connectedUsers.get(socketId);
+    if (!user) return false;
+
+    user.lastActivity = new Date();
+    return true;
   }
 
   // 타이핑 상태 설정
   setTyping(socketId: string, isTyping: boolean): boolean {
-    const user = this.users.get(socketId);
+    const user = this.connectedUsers.get(socketId);
     if (!user) return false;
 
     user.isTyping = isTyping;
-    user.lastSeen = new Date();
+    this.updateUserActivity(socketId);
     return true;
   }
 
-  // 방의 타이핑 중인 사용자들
-  getTypingUsers(roomId: string): ExtendedUser[] {
+  // 모든 연결된 사용자 조회
+  getAllUsers(): ConnectedUser[] {
+    return Array.from(this.connectedUsers.values());
+  }
+
+  // 방 목록 조회
+  getAllRooms(): RoomInfo[] {
+    const rooms: RoomInfo[] = [];
+
+    for (const [roomId, socketIds] of this.roomUsers.entries()) {
+      rooms.push({
+        roomId,
+        userIds: Array.from(socketIds),
+        userCount: socketIds.size,
+        createdAt: new Date(), // TODO: 실제 생성 시간 추적
+      });
+    }
+
+    return rooms;
+  }
+
+  // 특정 방 정보 조회
+  getRoomInfo(roomId: string): RoomInfo | null {
     const socketIds = this.roomUsers.get(roomId);
-    if (!socketIds) return [];
+    if (!socketIds) return null;
 
-    return Array.from(socketIds)
-      .map(socketId => this.users.get(socketId))
-      .filter((user): user is ExtendedUser => user !== undefined && user.isTyping);
+    return {
+      roomId,
+      userIds: Array.from(socketIds),
+      userCount: socketIds.size,
+      createdAt: new Date(), // TODO: 실제 생성 시간 추적
+    };
   }
 
-  // 사용자 활동 업데이트
-  updateUserActivity(socketId: string): void {
-    const user = this.users.get(socketId);
-    if (user) {
-      user.lastSeen = new Date();
-      user.isOnline = true;
-    }
-  }
-
-  // 비활성 사용자 정리 (선택사항)
-  cleanupInactiveUsers(inactiveThreshold: number = 30 * 60 * 1000): ExtendedUser[] {
-    const now = new Date();
-    const removedUsers: ExtendedUser[] = [];
-
-    for (const [socketId, user] of this.users.entries()) {
-      const timeSinceLastSeen = now.getTime() - user.lastSeen.getTime();
-      
-      if (timeSinceLastSeen > inactiveThreshold) {
-        const removedUser = this.removeUser(socketId);
-        if (removedUser) {
-          removedUsers.push(removedUser);
-        }
-      }
-    }
-
-    if (removedUsers.length > 0) {
-      console.log(`🧹 Cleaned up ${removedUsers.length} inactive users`);
-    }
-
-    return removedUsers;
-  }
-
-  // 통계
+  // 통계 정보
   getStats() {
-    const totalUsers = this.users.size;
-    const onlineUsers = Array.from(this.users.values()).filter(u => u.isOnline).length;
+    const totalUsers = this.connectedUsers.size;
     const totalRooms = this.roomUsers.size;
-    const typingUsers = Array.from(this.users.values()).filter(u => u.isTyping).length;
+    const onlineUsers = Array.from(this.connectedUsers.values()).filter(
+      (u) => u.isOnline
+    ).length;
+    const typingUsers = Array.from(this.connectedUsers.values()).filter(
+      (u) => u.isTyping
+    ).length;
+
+    const roomStats = new Map<string, number>();
+    for (const [roomId, socketIds] of this.roomUsers.entries()) {
+      roomStats.set(roomId, socketIds.size);
+    }
 
     return {
       totalUsers,
       onlineUsers,
       totalRooms,
       typingUsers,
-      rooms: Array.from(this.roomUsers.keys()),
-      usernames: Array.from(this.usernameToSocketId.keys()).sort()
+      rooms: Object.fromEntries(roomStats),
+      roomsList: Array.from(this.roomUsers.keys()),
     };
   }
 
-  // 방별 통계
-  getRoomStats(roomId: string) {
-    const users = this.getRoomUsers(roomId);
-    const onlineCount = users.filter(u => u.isOnline).length;
-    const typingCount = users.filter(u => u.isTyping).length;
+  // 비활성 사용자 정리 (선택적)
+  cleanupInactiveUsers(inactiveMinutes: number = 30): number {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - inactiveMinutes * 60 * 1000);
 
-    return {
-      roomId,
-      totalUsers: users.length,
-      onlineUsers: onlineCount,
-      typingUsers: typingCount,
-      users: users.map(u => ({
-        username: u.username,
-        isOnline: u.isOnline,
-        isTyping: u.isTyping,
-        lastSeen: u.lastSeen
-      }))
-    };
+    let cleanedCount = 0;
+
+    for (const [socketId, user] of this.connectedUsers.entries()) {
+      if (user.lastActivity < cutoff) {
+        this.removeUser(socketId);
+        cleanedCount++;
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(`Cleaned up ${cleanedCount} inactive users`);
+    }
+
+    return cleanedCount;
   }
 }
